@@ -1,0 +1,3 @@
+# Формат: название_группы:логин1:логин2:...
+testgroup:alice:bob:charlie
+devteam:alice:bob
