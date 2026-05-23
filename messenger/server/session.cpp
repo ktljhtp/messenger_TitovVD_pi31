@@ -2,7 +2,6 @@
 #include "auth.h"
 #include "logger.h"
 #include "../common/message.h"
-#include "../common/crypto.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -23,16 +22,6 @@
 //  при установке соединения и передаются через RSA.
 //  Здесь используем фиксированные для упрощения.
 // ──────────────────────────────────────────
-static const uint8_t SESSION_KEY[AES_KEY_LEN] = {
-    0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
-    0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,
-    0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
-    0x18,0x19,0x1a,0x1b,0x1c,0x1d,0x1e,0x1f
-};
-static const uint8_t SESSION_IV[AES_IV_LEN] = {
-    0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
-    0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f
-};
 
 // ──────────────────────────────────────────
 //  save_to_history — дозаписывает Message в history.dat
@@ -206,18 +195,8 @@ void handle_client(int client_fd, struct sockaddr_in addr)
                 break;
             }
 
-            // Расшифровываем текст сообщения
-            uint8_t plaintext[1040] = {0};
-            int plen = decrypt_message(
-                (uint8_t *)msg.text, (int)strlen(msg.text),
-                SESSION_KEY, SESSION_IV, plaintext
-            );
-            if (plen > 0) {
-                memset(msg.text, 0, sizeof(msg.text));
-                memcpy(msg.text, plaintext,
-                       plen < (int)sizeof(msg.text) - 1 ? plen : (int)sizeof(msg.text) - 1);
-            }
-
+            // Сервер НЕ расшифровывает — только маршрутизирует зашифрованные пакеты.
+            // text и text_len передаются получателю без изменений.
             log_event("Сообщение от '%s' тип=%d", login, msg.msg_type);
 
             // Сохраняем в историю

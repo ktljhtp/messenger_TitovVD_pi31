@@ -3,36 +3,48 @@
 #include <time.h>
 #include <stdint.h>
 
-// ──────────────────────────────────────────
-//  Константы протокола
-// ──────────────────────────────────────────
-#define DEFAULT_PORT     8080
-#define MAX_CLIENTS      10
-#define MSG_PERSONAL     0   // личное сообщение  → dest.receiver
-#define MSG_SYSTEM       1   // системное уведомление
-#define MSG_GROUP        2   // групповое         → dest.group_name
+#define DEFAULT_PORT  8080
+#define MAX_CLIENTS   10
+#define MSG_PERSONAL  0
+#define MSG_SYSTEM    1
+#define MSG_GROUP     2
 
-// ──────────────────────────────────────────
-//  Основная структура пакета (v2)
-//
-//  Передаётся целиком как бинарный блок
-//  фиксированного размера через send()/recv().
-//
-//  ВАЖНО: dest — union, receiver и group_name
-//  занимают одни и те же 32 байта памяти.
-//  Заполняй только одно поле в зависимости
-//  от msg_type:
-//    msg_type == MSG_PERSONAL → dest.receiver
-//    msg_type == MSG_GROUP    → dest.group_name
-//    msg_type == MSG_SYSTEM   → dest.receiver (логин получателя)
-// ──────────────────────────────────────────
+// Длина шифротекста хранится в первых 4 байтах поля text.
+// Остальные байты — сам шифротекст.
+// Это позволяет не менять размер структуры.
+#define MSG_CLEN_SIZE 4                      // sizeof(int) для длины
+#define MSG_TEXT_MAX  (1024 - MSG_CLEN_SIZE) // макс. байт шифротекста
+
 typedef struct {
-    char sender[32];       // логин отправителя
+    char   sender[32];
     union {
-        char receiver[32];    // логин получателя   (msg_type 0 или 1)
-        char group_name[32];  // имя группы          (msg_type 2)
-    } dest;                // ровно 32 байта — не 64!
-    char    text[1024];    // тело сообщения (зашифровано)
-    time_t  timestamp;     // время отправки (Unix timestamp)
-    int     msg_type;      // дискриминатор: 0 / 1 / 2
+        char receiver[32];
+        char group_name[32];
+    } dest;
+    char   text[1024]; // [0..3]=длина шифротекста, [4..]=шифротекст
+    time_t timestamp;
+    int    msg_type;
 } Message;
+
+// Вспомогательные inline-функции для работы с text
+#include <string.h>
+
+// Записать длину в начало text[]
+static inline void msg_set_clen(Message *m, int clen) {
+    memcpy(m->text, &clen, MSG_CLEN_SIZE);
+}
+
+// Прочитать длину из text[]
+static inline int msg_get_clen(const Message *m) {
+    int clen = 0;
+    memcpy(&clen, m->text, MSG_CLEN_SIZE);
+    return clen;
+}
+
+// Указатель на начало шифротекста внутри text[]
+static inline uint8_t *msg_cipher_ptr(Message *m) {
+    return (uint8_t *)(m->text + MSG_CLEN_SIZE);
+}
+static inline const uint8_t *msg_cipher_cptr(const Message *m) {
+    return (const uint8_t *)(m->text + MSG_CLEN_SIZE);
+}
