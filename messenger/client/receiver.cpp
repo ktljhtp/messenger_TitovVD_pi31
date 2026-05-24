@@ -2,10 +2,9 @@
 #include "../common/message.h"
 #include "../common/crypto.h"
 
-#include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 #include <sys/socket.h>
+#include <stdio.h>
 
 typedef struct { int server_fd; } ReceiverArgs;
 
@@ -27,21 +26,44 @@ void *receiver_thread(void *arg)
 
     while (1) {
         ssize_t n = recv(a->server_fd, &msg, sizeof(Message), MSG_WAITALL);
-        if (n <= 0) { ui_print_system("Соединение с сервером разорвано"); break; }
-        if (n != (ssize_t)sizeof(Message)) { ui_print_system("Неполный пакет"); continue; }
+        if (n <= 0) break;
+        if (n != (ssize_t)sizeof(Message)) continue;
 
         if (msg.msg_type == MSG_SYSTEM) {
-            // Системные сообщения — plaintext в text[] с нуля
-            ui_print_system(msg.text);
+            // Переводим серверные коды в понятные сообщения
+            const char *text = msg.text;
+            const char *display = nullptr;
+            char tmp[512] = {0};
+
+            if      (strcmp(text, "OK_NEWUSER")    == 0) display = "✓ Пользователь создан";
+            else if (strcmp(text, "OK_NEWGROUP")   == 0) display = "✓ Группа создана";
+            else if (strcmp(text, "OK_ADDMEMBER")  == 0) display = "✓ Участник добавлен в группу";
+            else if (strcmp(text, "ERR_EXISTS")    == 0) display = "✗ Уже существует";
+            else if (strcmp(text, "ERR_NOGROUP")   == 0) display = "✗ Группа не найдена";
+            else if (strcmp(text, "ERR_BADFORMAT") == 0) display = "✗ Неверный формат команды";
+            else if (strcmp(text, "ERR_SERVER")    == 0) display = "✗ Ошибка сервера";
+            else if (strncmp(text, "USERS:", 6) == 0) {
+                // Форматируем список пользователей
+                snprintf(tmp, sizeof(tmp), "Пользователи: %s", text + 6);
+                // Заменяем : на ", "
+                for (char *p = tmp + 14; *p; p++) if (*p == ':') { *p = ' '; }
+                display = tmp;
+            }
+            else if (strncmp(text, "GROUPS:", 7) == 0) {
+                snprintf(tmp, sizeof(tmp), "Группы: %s", text + 7);
+                for (char *p = tmp + 8; *p; p++) if (*p == ':') { *p = ' '; }
+                display = tmp;
+            }
+            else display = text; // неизвестное — показываем как есть
+
+            printf("\n\033[33m [!] %s\033[0m\n", display);
+            fflush(stdout);
             continue;
         }
 
-        // Читаем длину шифротекста из первых 4 байт
+        // Расшифровываем текст
         int clen = msg_get_clen(&msg);
-        if (clen <= 0 || clen > MSG_TEXT_MAX) {
-            ui_print_system("Получено сообщение с неверной длиной шифротекста");
-            continue;
-        }
+        if (clen <= 0 || clen > MSG_TEXT_MAX) continue;
 
         uint8_t plaintext[MSG_TEXT_MAX + 16] = {0};
         int plen = decrypt_message(
@@ -49,16 +71,16 @@ void *receiver_thread(void *arg)
             SESSION_KEY, SESSION_IV, plaintext
         );
 
-        if (plen > 0) {
-            // Заменяем text[] расшифрованной строкой для передачи в ui
-            memset(msg.text, 0, sizeof(msg.text));
-            int copy = plen < (int)sizeof(msg.text) - 1 ? plen : (int)sizeof(msg.text) - 1;
-            memcpy(msg.text, plaintext, copy);
-        } else {
-            snprintf(msg.text, sizeof(msg.text), "[ошибка расшифровки]");
-        }
+        if (plen <= 0) continue;
 
-        ui_print_message(&msg);
+        // Подставляем расшифрованный текст
+        memset(msg.text, 0, sizeof(msg.text));
+        int copy = plen < (int)sizeof(msg.text) - 1 ? plen : (int)sizeof(msg.text) - 1;
+        memcpy(msg.text, plaintext, copy);
+
+        // Передаём в UI — он сам разберёт в какой чат положить
+        ui_receive_message(&msg);
     }
+
     return nullptr;
 }
