@@ -133,7 +133,7 @@ static void cmd_newgroup(int client_fd, const char *login,
     // Проверяем что группа не существует
     FILE *f = fopen(GROUPS_DAT, "r");
     if (f) {
-        char line[512];
+        char line[600];
         while (fgets(line, sizeof(line), f)) {
             char existing[64] = {0};
             sscanf(line, "%63[^:]", existing);
@@ -195,11 +195,11 @@ static void cmd_addmember(int client_fd, const char *login,
     if (!fin) { send_sys(client_fd, login, "ERR_NOGROUP"); return; }
 
     // Собираем новый файл в памяти
-    char lines[64][512];
+    char lines[64][768];  // 512 (строка) + 64 (логин) + запас
     int  line_count = 0;
     int  found = 0;
 
-    char line[512];
+    char line[600];
     while (fgets(line, sizeof(line), fin) && line_count < 64) {
         line[strcspn(line, "\n")] = '\0';
         char gname[64] = {0};
@@ -215,7 +215,7 @@ static void cmd_addmember(int client_fd, const char *login,
             }
             // Добавляем нового участника в конец строки
             snprintf(lines[line_count], sizeof(lines[line_count]),
-                     "%s:%s", line, new_member);
+                     "%s:%s", line, new_member);  // NOLINT
         } else {
             strncpy(lines[line_count], line, sizeof(lines[line_count]) - 1);
         }
@@ -248,7 +248,7 @@ static void cmd_listgroups(int client_fd, const char *login)
 {
     FILE *f = fopen(GROUPS_DAT, "r");
     char result[1000] = "GROUPS:";
-    char line[512];
+    char line[600];
     while (f && fgets(line, sizeof(line), f)) {
         char gname[64] = {0};
         sscanf(line, "%63[^:]", gname);
@@ -326,7 +326,7 @@ int route_message(const Message *msg)
         FILE *f = fopen(GROUPS_DAT, "r");
         if (!f) return -1;
 
-        char line[512];
+        char line[600];
         int delivered = 0;
 
         while (fgets(line, sizeof(line), f)) {

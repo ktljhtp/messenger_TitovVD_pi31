@@ -1,446 +1,654 @@
-#include "session.h"
-#include "auth.h"
-#include "logger.h"
+#include "ui.h"
 #include "../common/message.h"
+#include "../common/crypto.h"
 
-#include <stdio.h>
+#include <locale.h>
+#include <pthread.h>
 #include <string.h>
+#include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <errno.h>
 #include <time.h>
-#include <signal.h>
+#include <unistd.h>
+#include <termios.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <dirent.h>
 
-// ──────────────────────────────────────────
-//  Вспомогательная: отправить системный ответ клиенту
-// ──────────────────────────────────────────
-static void send_sys(int client_fd, const char *login, const char *text)
+// ── ANSI цвета ──────────────────────────
+#define R      "\033[0m"
+#define BOLD   "\033[1m"
+#define GREEN  "\033[32m"
+#define YELLOW "\033[33m"
+#define CYAN   "\033[36m"
+#define BLUE   "\033[34m"
+#define GRAY   "\033[90m"
+#define RED    "\033[31m"
+#define CLEAR  "\r\033[2K"
+
+// ── Константы ───────────────────────────
+#define MAX_CHATS    64
+#define MAX_MSGS     512
+#define MSG_LINE_LEN 512
+
+// ── Структуры ───────────────────────────
+typedef struct {
+    char time[10];
+    char sender[32];
+    char text[MSG_LINE_LEN];
+} StoredMsg;
+
+typedef struct {
+    char      name[64];
+    int       is_group;
+    int       unread;
+    StoredMsg msgs[MAX_MSGS];
+    int       msg_count;
+} Chat;
+
+// ── Глобальное состояние ─────────────────
+static Chat            chats[MAX_CHATS];
+static int             chat_count  = 0;
+static int             active_chat = -1;
+static pthread_mutex_t ui_mutex    = PTHREAD_MUTEX_INITIALIZER;
+static struct termios  orig_termios;
+static int             raw_mode    = 0;
+static char            my_login[32]      = {0};
+static char            history_dir[128]  = {0};
+static int             g_server_fd       = -1;
+
+// ── Ключ/IV (совпадают с receiver.cpp) ──
+static const uint8_t SESSION_KEY[AES_KEY_LEN] = {
+    0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+    0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,
+    0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+    0x18,0x19,0x1a,0x1b,0x1c,0x1d,0x1e,0x1f
+};
+static const uint8_t SESSION_IV[AES_IV_LEN] = {
+    0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+    0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f
+};
+
+// ════════════════════════════════════════
+//  RAW-РЕЖИМ ТЕРМИНАЛА
+// ════════════════════════════════════════
+static void enable_raw()
 {
-    Message sys = {};
-    sys.msg_type  = MSG_SYSTEM;
-    sys.timestamp = time(nullptr);
-    strncpy(sys.sender,        "server", sizeof(sys.sender) - 1);
-    strncpy(sys.dest.receiver, login,    sizeof(sys.dest.receiver) - 1);
-    snprintf(sys.text, sizeof(sys.text), "%s", text);
-    send(client_fd, &sys, sizeof(Message), 0);
+    tcgetattr(STDIN_FILENO, &orig_termios);
+    struct termios raw = orig_termios;
+    raw.c_lflag &= ~(ICANON | ECHO | ISIG);
+    raw.c_iflag &= ~(IXON);
+    raw.c_cc[VMIN] = 1; raw.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+    raw_mode = 1;
+}
+static void disable_raw()
+{
+    if (raw_mode) { tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios); raw_mode = 0; }
 }
 
-// ──────────────────────────────────────────
-//  save_to_history
-// ──────────────────────────────────────────
-static void save_to_history(const Message *msg)
-{
-    FILE *f = fopen("data/history.dat", "ab");
-    if (!f) return;
-    fwrite(msg, sizeof(Message), 1, f);
-    fclose(f);
-}
+// forward declaration
+static int find_or_create_chat(const char *name, int is_group);
 
-// ──────────────────────────────────────────
-//  cmd_newuser
+// ════════════════════════════════════════
+//  ИСТОРИЯ НА ДИСКЕ
 //
-//  Формат команды в msg.text: NEWUSER:логин:пароль:имя
-//  Добавляет строку в data/users.dat
-//  Ответы: OK_NEWUSER / ERR_EXISTS / ERR_BADFORMAT
-// ──────────────────────────────────────────
-static void cmd_newuser(int client_fd, const char *login,
-                        const char *payload)
+//  Папка:   history/<мой_логин>/
+//  Файл:    history/<мой_логин>/<имя_чата>.log
+//  Строка:  UNIX_TIMESTAMP|ОТПРАВИТЕЛЬ|ТЕКСТ
+// ════════════════════════════════════════
+static void history_init()
 {
-    // Парсим: логин:пароль:имя
-    char new_login[32] = {0};
-    char password[64]  = {0};
-    char disp_name[64] = {0};
+    mkdir("history", 0755);
+    mkdir(history_dir, 0755);
 
-    // payload = "логин:пароль:имя"
-    char buf[256];
-    strncpy(buf, payload, sizeof(buf) - 1);
+    // Сканируем папку history/<логин>/ и загружаем все чаты
+    DIR *dir = opendir(history_dir);
+    if (!dir) return;
 
-    char *p1 = strchr(buf, ':');
-    if (!p1) { send_sys(client_fd, login, "ERR_BADFORMAT"); return; }
-    *p1 = '\0';
-    char *p2 = strchr(p1 + 1, ':');
-    if (!p2) { send_sys(client_fd, login, "ERR_BADFORMAT"); return; }
-    *p2 = '\0';
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        // Пропускаем . и ..
+        if (entry->d_name[0] == '.') continue;
 
-    strncpy(new_login,  buf,      sizeof(new_login)  - 1);
-    strncpy(password,   p1 + 1,   sizeof(password)   - 1);
-    strncpy(disp_name,  p2 + 1,   sizeof(disp_name)  - 1);
+        // Берём только файлы .log
+        char *dot = strrchr(entry->d_name, '.');
+        if (!dot || strcmp(dot, ".log") != 0) continue;
 
-    // Проверяем что логин не занят
-    FILE *f = fopen(USERS_DAT, "r");
-    if (f) {
-        char line[256];
-        while (fgets(line, sizeof(line), f)) {
-            char existing[32] = {0};
-            sscanf(line, "%31[^:]", existing);
-            if (strcmp(existing, new_login) == 0) {
-                fclose(f);
-                send_sys(client_fd, login, "ERR_EXISTS");
-                log_event("Попытка создать дубль пользователя '%s' от '%s'",
-                          new_login, login);
-                return;
-            }
-        }
-        fclose(f);
+        // Имя чата = имя файла без .log
+        char chat_name[64] = {0};
+        int namelen = (int)(dot - entry->d_name);
+        if (namelen <= 0 || namelen >= (int)sizeof(chat_name)) continue;
+        strncpy(chat_name, entry->d_name, namelen);
+
+        // Определяем тип чата: если имя начинается с "group_" — группа
+        // Иначе — личный чат
+        // (группы сохраняются с префиксом "group_" — см. history_append)
+        int is_group = (strncmp(chat_name, "group_", 6) == 0);
+        const char *display_name = is_group ? chat_name + 6 : chat_name;
+
+        // Создаём чат и загружаем историю
+        int idx = find_or_create_chat(display_name, is_group);
+        (void)idx;
     }
-
-    // Хешируем пароль
-    const char *hashed = hash_password(password);
-
-    // Дозаписываем в users.dat
-    f = fopen(USERS_DAT, "a");
-    if (!f) { send_sys(client_fd, login, "ERR_SERVER"); return; }
-    fprintf(f, "%s:%s:%s\n", new_login, hashed, disp_name);
-    fclose(f);
-
-    log_event("Пользователь '%s' создан по запросу '%s'", new_login, login);
-    send_sys(client_fd, login, "OK_NEWUSER");
+    closedir(dir);
 }
 
-// ──────────────────────────────────────────
-//  cmd_newgroup
-//
-//  Формат: NEWGROUP:название:участник1:участник2:...
-//  Создатель добавляется автоматически.
-//  Ответы: OK_NEWGROUP / ERR_EXISTS / ERR_BADFORMAT
-// ──────────────────────────────────────────
-static void cmd_newgroup(int client_fd, const char *login,
-                         const char *payload)
+static void history_append(const char *chat_name, int is_group,
+                            const char *sender, const char *text, time_t ts)
 {
-    // payload = "название:участник1:участник2:..."
-    char buf[512];
-    strncpy(buf, payload, sizeof(buf) - 1);
-
-    char *colon = strchr(buf, ':');
-    // Имя группы может быть без участников (только создатель)
-    char group_name[64] = {0};
-    if (colon) {
-        int namelen = (int)(colon - buf);
-        if (namelen <= 0 || namelen >= (int)sizeof(group_name)) {
-            send_sys(client_fd, login, "ERR_BADFORMAT"); return;
-        }
-        strncpy(group_name, buf, namelen);
-    } else {
-        strncpy(group_name, buf, sizeof(group_name) - 1);
-    }
-
-    // Проверяем что группа не существует
-    FILE *f = fopen(GROUPS_DAT, "r");
-    if (f) {
-        char line[512];
-        while (fgets(line, sizeof(line), f)) {
-            char existing[64] = {0};
-            sscanf(line, "%63[^:]", existing);
-            if (strcmp(existing, group_name) == 0) {
-                fclose(f);
-                send_sys(client_fd, login, "ERR_EXISTS");
-                return;
-            }
-        }
-        fclose(f);
-    }
-
-    // Формируем строку: группа:создатель:участник1:участник2:...
-    f = fopen(GROUPS_DAT, "a");
-    if (!f) { send_sys(client_fd, login, "ERR_SERVER"); return; }
-
-    fprintf(f, "%s:%s", group_name, login); // создатель всегда первый
-
-    // Добавляем остальных участников (если есть)
-    if (colon) {
-        char *member = strtok(colon + 1, ":");
-        while (member) {
-            // Не дублируем создателя
-            if (strcmp(member, login) != 0) {
-                fprintf(f, ":%s", member);
-            }
-            member = strtok(nullptr, ":");
-        }
-    }
-    fprintf(f, "\n");
-    fclose(f);
-
-    log_event("Группа '%s' создана пользователем '%s'", group_name, login);
-    send_sys(client_fd, login, "OK_NEWGROUP");
-}
-
-// ──────────────────────────────────────────
-//  cmd_addmember
-//
-//  Формат: ADDMEMBER:группа:логин
-//  Добавляет участника в существующую группу.
-//  Ответы: OK_ADDMEMBER / ERR_NOGROUP / ERR_EXISTS
-// ──────────────────────────────────────────
-static void cmd_addmember(int client_fd, const char *login,
-                          const char *payload)
-{
-    char buf[256];
-    strncpy(buf, payload, sizeof(buf) - 1);
-
-    char *colon = strchr(buf, ':');
-    if (!colon) { send_sys(client_fd, login, "ERR_BADFORMAT"); return; }
-    *colon = '\0';
-
-    const char *group_name  = buf;
-    const char *new_member  = colon + 1;
-
-    // Читаем groups.dat, ищем группу и добавляем участника
-    FILE *fin = fopen(GROUPS_DAT, "r");
-    if (!fin) { send_sys(client_fd, login, "ERR_NOGROUP"); return; }
-
-    // Собираем новый файл в памяти
-    char lines[64][512];
-    int  line_count = 0;
-    int  found = 0;
-
-    char line[512];
-    while (fgets(line, sizeof(line), fin) && line_count < 64) {
-        line[strcspn(line, "\n")] = '\0';
-        char gname[64] = {0};
-        sscanf(line, "%63[^:]", gname);
-
-        if (strcmp(gname, group_name) == 0) {
-            found = 1;
-            // Проверяем что участник ещё не в группе
-            if (strstr(line, new_member)) {
-                fclose(fin);
-                send_sys(client_fd, login, "ERR_EXISTS");
-                return;
-            }
-            // Добавляем нового участника в конец строки
-            snprintf(lines[line_count], sizeof(lines[line_count]),
-                     "%s:%s", line, new_member);
-        } else {
-            strncpy(lines[line_count], line, sizeof(lines[line_count]) - 1);
-        }
-        line_count++;
-    }
-    fclose(fin);
-
-    if (!found) { send_sys(client_fd, login, "ERR_NOGROUP"); return; }
-
-    // Перезаписываем groups.dat
-    FILE *fout = fopen(GROUPS_DAT, "w");
-    if (!fout) { send_sys(client_fd, login, "ERR_SERVER"); return; }
-    for (int i = 0; i < line_count; i++)
-        fprintf(fout, "%s\n", lines[i]);
-    fclose(fout);
-
-    log_event("Участник '%s' добавлен в группу '%s' по запросу '%s'",
-              new_member, group_name, login);
-    send_sys(client_fd, login, "OK_ADDMEMBER");
-}
-
-// ──────────────────────────────────────────
-//  cmd_listgroups / cmd_listusers
-//
-//  Возвращают список через системные сообщения:
-//    GROUPS:группа1:группа2:...
-//    USERS:логин1:логин2:...
-// ──────────────────────────────────────────
-static void cmd_listgroups(int client_fd, const char *login)
-{
-    FILE *f = fopen(GROUPS_DAT, "r");
-    char result[1000] = "GROUPS:";
-    char line[512];
-    while (f && fgets(line, sizeof(line), f)) {
-        char gname[64] = {0};
-        sscanf(line, "%63[^:]", gname);
-        if (gname[0] == '#' || gname[0] == '\0') continue;
-        if (strlen(result) + strlen(gname) + 2 < sizeof(result)) {
-            if (strlen(result) > 7) strcat(result, ":");
-            strcat(result, gname);
-        }
-    }
-    if (f) fclose(f);
-    send_sys(client_fd, login, result);
-}
-
-static void cmd_listusers(int client_fd, const char *login)
-{
-    FILE *f = fopen(USERS_DAT, "r");
-    char result[1000] = "USERS:";
-    char line[256];
-    while (f && fgets(line, sizeof(line), f)) {
-        char uname[32] = {0};
-        sscanf(line, "%31[^:]", uname);
-        if (uname[0] == '#' || uname[0] == '\0') continue;
-        if (strlen(result) + strlen(uname) + 2 < sizeof(result)) {
-            if (strlen(result) > 6) strcat(result, ":");
-            strcat(result, uname);
-        }
-    }
-    if (f) fclose(f);
-    send_sys(client_fd, login, result);
-}
-
-// ──────────────────────────────────────────
-//  handle_system_command
-//
-//  Разбирает msg.text системного сообщения
-//  и вызывает нужный обработчик.
-// ──────────────────────────────────────────
-static void handle_system_command(int client_fd, const char *login,
-                                   const Message *msg)
-{
-    const char *text = msg->text;
-
-    if (strncmp(text, "NEWUSER:", 8) == 0)
-        cmd_newuser(client_fd, login, text + 8);
-    else if (strncmp(text, "NEWGROUP:", 9) == 0)
-        cmd_newgroup(client_fd, login, text + 9);
-    else if (strncmp(text, "ADDMEMBER:", 10) == 0)
-        cmd_addmember(client_fd, login, text + 10);
-    else if (strcmp(text, "LISTGROUPS") == 0)
-        cmd_listgroups(client_fd, login);
-    else if (strcmp(text, "USERS") == 0 || strcmp(text, "LISTUSERS") == 0)
-        cmd_listusers(client_fd, login);
+    char path[300];
+    if (is_group)
+        snprintf(path, sizeof(path), "%s/group_%s.log", history_dir, chat_name);
     else
-        log_event("Неизвестная системная команда от '%s': %s", login, text);
+        snprintf(path, sizeof(path), "%s/%s.log", history_dir, chat_name);
+    FILE *f = fopen(path, "a");
+    if (!f) return;
+
+    // Убираем | и \n из текста чтобы не ломать формат
+    char safe[MSG_LINE_LEN];
+    int j = 0;
+    for (int i = 0; text[i] && j < (int)sizeof(safe) - 2; i++)
+        safe[j++] = (text[i] == '|' || text[i] == '\n') ? ' ' : text[i];
+    safe[j] = '\0';
+
+    fprintf(f, "%ld|%s|%s\n", (long)ts, sender, safe);
+    fclose(f);
 }
 
-// ──────────────────────────────────────────
-//  route_message
-// ──────────────────────────────────────────
-int route_message(const Message *msg)
+// forward declaration — нужна для history_load
+static void chat_add_msg_nohistory(int idx, const char *sender,
+                                   const char *text, time_t ts);
+
+static void history_load(int idx)
 {
-    if (msg->msg_type == MSG_PERSONAL) {
-        char fifo_path[FIFO_MAXPATH];
-        snprintf(fifo_path, sizeof(fifo_path), FIFO_PATH, msg->dest.receiver);
-        int fd = open(fifo_path, O_WRONLY | O_NONBLOCK);
-        if (fd < 0) {
-            log_event("Получатель %s не в сети", msg->dest.receiver);
-            return -1;
-        }
-        ssize_t w = write(fd, msg, sizeof(Message));
-        close(fd);
-        return (w == (ssize_t)sizeof(Message)) ? 0 : -1;
+    char path[300];
+    if (chats[idx].is_group)
+        snprintf(path, sizeof(path), "%s/group_%s.log", history_dir, chats[idx].name);
+    else
+        snprintf(path, sizeof(path), "%s/%s.log", history_dir, chats[idx].name);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
 
-    } else if (msg->msg_type == MSG_GROUP) {
-        FILE *f = fopen(GROUPS_DAT, "r");
-        if (!f) return -1;
-
-        char line[512];
-        int delivered = 0;
-
-        while (fgets(line, sizeof(line), f)) {
-            line[strcspn(line, "\n")] = '\0';
-            char *group = strtok(line, ":");
-            if (!group || strcmp(group, msg->dest.group_name) != 0) continue;
-
-            char *member;
-            while ((member = strtok(nullptr, ":")) != nullptr) {
-                if (strcmp(member, msg->sender) == 0) continue;
-                char fifo_path[FIFO_MAXPATH];
-                snprintf(fifo_path, sizeof(fifo_path), FIFO_PATH, member);
-                int fd = open(fifo_path, O_WRONLY | O_NONBLOCK);
-                if (fd < 0) continue;
-                write(fd, msg, sizeof(Message));
-                close(fd);
-                delivered++;
-            }
-            break;
-        }
-        fclose(f);
-        log_event("Группа '%s' от '%s': %d доставлено",
-                  msg->dest.group_name, msg->sender, delivered);
-        return (delivered > 0) ? 0 : -1;
+    char line[MSG_LINE_LEN + 80];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\n")] = '\0';
+        char *p1 = strchr(line, '|');  if (!p1) continue;
+        *p1 = '\0';
+        char *p2 = strchr(p1 + 1, '|'); if (!p2) continue;
+        *p2 = '\0';
+        time_t ts      = (time_t)atol(line);
+        const char *sn = p1 + 1;
+        const char *tx = p2 + 1;
+        chat_add_msg_nohistory(idx, sn, tx, ts);
     }
-    return -1;
+    fclose(f);
 }
 
-// ──────────────────────────────────────────
-//  handle_client
-// ──────────────────────────────────────────
-void handle_client(int client_fd, struct sockaddr_in addr)
+// ════════════════════════════════════════
+//  УПРАВЛЕНИЕ ЧАТАМИ В ПАМЯТИ
+// ════════════════════════════════════════
+
+// Добавить сообщение БЕЗ записи на диск (используется при загрузке истории)
+static void chat_add_msg_nohistory(int idx, const char *sender,
+                                   const char *text, time_t ts)
 {
-    char client_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &addr.sin_addr, client_ip, sizeof(client_ip));
-    log_event("Новое подключение с %s", client_ip);
-
-    char login[32] = {0};
-    if (authenticate(client_fd, login) < 0) {
-        log_event("Отказ в доступе для %s", client_ip);
-        close(client_fd);
-        return;
+    Chat *c = &chats[idx];
+    if (c->msg_count >= MAX_MSGS) {
+        memmove(&c->msgs[0], &c->msgs[1], sizeof(StoredMsg) * (MAX_MSGS - 1));
+        c->msg_count = MAX_MSGS - 1;
     }
-    log_event("Пользователь '%s' вошёл (%s)", login, client_ip);
+    StoredMsg *m = &c->msgs[c->msg_count++];
+    struct tm *t = localtime(&ts);
+    strftime(m->time, sizeof(m->time), "%H:%M", t);
+    strncpy(m->sender, sender, sizeof(m->sender) - 1);
+    strncpy(m->text,   text,   sizeof(m->text)   - 1);
+}
 
-    char fifo_path[FIFO_MAXPATH];
-    snprintf(fifo_path, sizeof(fifo_path), FIFO_PATH, login);
-    unlink(fifo_path);
+// Добавить сообщение С записью на диск (используется при отправке/получении)
+static void chat_add_msg(int idx, const char *sender,
+                         const char *text, time_t ts)
+{
+    chat_add_msg_nohistory(idx, sender, text, ts);
+    history_append(chats[idx].name, chats[idx].is_group, sender, text, ts);
+}
 
-    if (mkfifo(fifo_path, 0666) < 0) {
-        log_event("ОШИБКА mkfifo для %s: %s", login, strerror(errno));
-        close(client_fd); return;
-    }
+// Найти чат по имени или создать новый (с загрузкой истории)
+static int find_or_create_chat(const char *name, int is_group)
+{
+    for (int i = 0; i < chat_count; i++)
+        if (strcmp(chats[i].name, name) == 0) return i;
 
-    int fifo_fd = open(fifo_path, O_RDWR | O_NONBLOCK);
-    if (fifo_fd < 0) {
-        log_event("ОШИБКА open FIFO для %s: %s", login, strerror(errno));
-        unlink(fifo_path); close(client_fd); return;
-    }
+    if (chat_count >= MAX_CHATS) return -1;
 
-    Message msg;
-    fd_set read_fds;
-    int maxfd = (client_fd > fifo_fd ? client_fd : fifo_fd) + 1;
+    int idx = chat_count++;
+    memset(&chats[idx], 0, sizeof(Chat));
+    strncpy(chats[idx].name, name, sizeof(chats[idx].name) - 1);
+    chats[idx].is_group = is_group;
+    chats[idx].unread   = 0;
+
+    history_load(idx); // ← загружаем историю при первом обращении к чату
+    return idx;
+}
+
+// ════════════════════════════════════════
+//  ВВОД СТРОКИ (raw-режим, UTF-8)
+// ════════════════════════════════════════
+static int read_line(char *buf, int maxlen, const char *prompt)
+{
+    enable_raw();
+    memset(buf, 0, maxlen);
+    int len = 0;
+
+    printf(CLEAR "%s%s" R, CYAN, prompt);
+    fflush(stdout);
 
     while (1) {
-        FD_ZERO(&read_fds);
-        FD_SET(client_fd, &read_fds);
-        FD_SET(fifo_fd,   &read_fds);
+        unsigned char ch;
+        if (read(STDIN_FILENO, &ch, 1) <= 0) { disable_raw(); return -1; }
 
-        int ready = select(maxfd, &read_fds, nullptr, nullptr, nullptr);
-        if (ready < 0) {
-            if (errno == EINTR) continue;
-            break;
+        if (ch == 3 || ch == 4)               { disable_raw(); printf("\n"); return -1; }
+        if (ch == '\r' || ch == '\n')          { buf[len] = '\0'; disable_raw(); printf("\n"); return len; }
+
+        // ESC-последовательности (стрелки) — съедаем
+        if (ch == 27) {
+            struct termios tmp = orig_termios;
+            tmp.c_lflag &= ~(ICANON | ECHO);
+            tmp.c_cc[VMIN] = 0; tmp.c_cc[VTIME] = 1;
+            tcsetattr(STDIN_FILENO, TCSAFLUSH, &tmp);
+            unsigned char esc[8]; read(STDIN_FILENO, esc, sizeof(esc));
+            enable_raw();
+            continue;
         }
 
-        if (FD_ISSET(client_fd, &read_fds)) {
-            ssize_t n = recv(client_fd, &msg, sizeof(Message), MSG_WAITALL);
-            if (n <= 0) {
-                log_event("Пользователь '%s' отключился", login);
-                break;
+        // Backspace
+        if (ch == 127 || ch == 8) {
+            if (len > 0) {
+                len--;
+                while (len > 0 && (buf[len] & 0xC0) == 0x80) len--;
+                buf[len] = '\0';
+                printf(CLEAR "%s%s%s" R, CYAN, prompt, buf);
+                fflush(stdout);
             }
+            continue;
+        }
 
-            log_event("Сообщение от '%s' тип=%d", login, msg.msg_type);
+        // ASCII
+        if (ch >= 0x20 && ch <= 0x7E && len < maxlen - 1) {
+            buf[len++] = (char)ch; buf[len] = '\0';
+            printf(CLEAR "%s%s%s" R, CYAN, prompt, buf);
+            fflush(stdout);
+            continue;
+        }
 
-            if (msg.msg_type == MSG_SYSTEM) {
-                // Системная команда — обрабатываем на сервере
-                handle_system_command(client_fd, login, &msg);
+        // UTF-8 (кириллица и др.)
+        if (ch >= 0xC0 && ch <= 0xF7 && len < maxlen - 4) {
+            int extra = (ch >= 0xF0) ? 3 : (ch >= 0xE0) ? 2 : 1;
+            buf[len++] = (char)ch;
+            unsigned char cont[3] = {0};
+            int got = (int)read(STDIN_FILENO, cont, extra);
+            for (int i = 0; i < got; i++) buf[len++] = (char)cont[i];
+            buf[len] = '\0';
+            printf(CLEAR "%s%s%s" R, CYAN, prompt, buf);
+            fflush(stdout);
+        }
+    }
+}
+
+// ════════════════════════════════════════
+//  ОТРИСОВКА
+// ════════════════════════════════════════
+static void draw_chat_list()
+{
+    printf("\033[2J\033[H");
+    printf(BOLD CYAN
+        "╔══════════════════════════════════════╗\n"
+        "║  МЕССЕНДЖЕР  —  %s%-20s" CYAN "║\n"
+        "╚══════════════════════════════════════╝\n" R,
+        GREEN, my_login);
+
+    if (chat_count == 0) {
+        printf(GRAY "\n  Нет чатов. Отправьте первое сообщение:\n"
+                    "  /msg <логин> <текст>\n\n" R);
+    } else {
+        printf(GRAY "  Выберите чат (номер) или введите команду\n\n" R);
+        for (int i = 0; i < chat_count; i++) {
+            const char *icon = chats[i].is_group ? "👥" : "💬";
+            // Последнее сообщение в превью
+            const char *preview = "";
+            if (chats[i].msg_count > 0)
+                preview = chats[i].msgs[chats[i].msg_count - 1].text;
+
+            if (chats[i].unread > 0) {
+                printf(BOLD "  %d. %s %-20s" YELLOW " [%d новых]" GRAY " %.20s\n" R,
+                       i+1, icon, chats[i].name, chats[i].unread, preview);
             } else {
-                save_to_history(&msg);
-                if (route_message(&msg) < 0) {
-                    char errtext[256];
-                    if (msg.msg_type == MSG_PERSONAL)
-                        snprintf(errtext, sizeof(errtext),
-                                 "Пользователь '%s' не в сети",
-                                 msg.dest.receiver);
-                    else
-                        snprintf(errtext, sizeof(errtext),
-                                 "Группа '%s' недоступна или нет участников онлайн",
-                                 msg.dest.group_name);
-                    send_sys(client_fd, login, errtext);
-                }
+                printf("  %d. %s %-20s " GRAY "%.25s\n" R,
+                       i+1, icon, chats[i].name, preview);
             }
-        }
-
-        if (FD_ISSET(fifo_fd, &read_fds)) {
-            Message incoming;
-            ssize_t n = read(fifo_fd, &incoming, sizeof(Message));
-            if (n == (ssize_t)sizeof(Message))
-                send(client_fd, &incoming, sizeof(Message), 0);
         }
     }
 
-    close(fifo_fd);
-    unlink(fifo_path);
-    close(client_fd);
-    log_event("Сессия '%s' завершена", login);
+    printf(GRAY
+        "\n──────────────────────────────────────────\n"
+        "  <номер>                — открыть чат\n"
+        "  /msg <логин> <текст>   — новое сообщение\n"
+        "  /group <группа> <текст>— в группу\n"
+        "  /quit                  — выход\n"
+        "──────────────────────────────────────────\n" R);
+}
+
+static void draw_chat(int idx)
+{
+    Chat *c = &chats[idx];
+    printf("\033[2J\033[H");
+
+    const char *icon = c->is_group ? "👥" : "💬";
+    printf(BOLD CYAN
+        "╔══════════════════════════════════════╗\n"
+        "║  %s %-35s" CYAN "║\n"
+        "╚══════════════════════════════════════╝\n" R,
+        icon, c->name);
+
+    if (c->msg_count == 0) {
+        printf(GRAY "\n  Нет сообщений\n\n" R);
+    } else {
+        printf("\n");
+        int start = c->msg_count > 20 ? c->msg_count - 20 : 0;
+        for (int i = start; i < c->msg_count; i++) {
+            StoredMsg *m = &c->msgs[i];
+            if (strcmp(m->sender, my_login) == 0)
+                printf(GRAY "  [%s] " R BOLD GREEN "Вы: " R "%s\n", m->time, m->text);
+            else
+                printf(GRAY "  [%s] " R BOLD BLUE "%s: " R "%s\n", m->time, m->sender, m->text);
+        }
+        printf("\n");
+    }
+
+    int total = c->msg_count;
+    printf(GRAY
+        "  Сообщений в истории: %d\n"
+        "──────────────────────────────────────────\n"
+        "  Введите текст → Enter для отправки\n"
+        "  /back — список чатов  |  /quit — выход\n"
+        "──────────────────────────────────────────\n" R, total);
+    c->unread = 0;
+}
+
+// ════════════════════════════════════════
+//  ОТПРАВКА СООБЩЕНИЯ
+// ════════════════════════════════════════
+static int send_message(int server_fd, int msg_type,
+                        const char *dest, const char *text)
+{
+    Message msg = {};
+    msg.msg_type  = msg_type;
+    msg.timestamp = time(nullptr);
+    strncpy(msg.sender,        my_login, sizeof(msg.sender) - 1);
+    strncpy(msg.dest.receiver, dest,     sizeof(msg.dest.receiver) - 1);
+
+    uint8_t cipher[MSG_TEXT_MAX + 16] = {0};
+    int clen = encrypt_message((const uint8_t *)text, (int)strlen(text),
+                               SESSION_KEY, SESSION_IV, cipher);
+    if (clen <= 0 || clen > MSG_TEXT_MAX) {
+        printf(RED "  Ошибка шифрования\n" R);
+        return -1;
+    }
+    msg_set_clen(&msg, clen);
+    memcpy(msg_cipher_ptr(&msg), cipher, clen);
+
+    if (send(server_fd, &msg, sizeof(Message), 0) != (ssize_t)sizeof(Message)) {
+        printf(RED "  Ошибка отправки\n" R);
+        return -1;
+    }
+    return 0;
+}
+
+// ════════════════════════════════════════
+//  ПУБЛИЧНЫЕ ФУНКЦИИ
+// ════════════════════════════════════════
+void ui_init(const char *login)
+{
+    setlocale(LC_ALL, "");
+    strncpy(my_login, login, sizeof(my_login) - 1);
+    snprintf(history_dir, sizeof(history_dir), "history/%s", login);
+    history_init();
+}
+
+void ui_receive_message(const Message *msg)
+{
+    pthread_mutex_lock(&ui_mutex);
+
+    const char *chat_name;
+    int is_group;
+    if (msg->msg_type == MSG_GROUP) {
+        chat_name = msg->dest.group_name;
+        is_group  = 1;
+    } else {
+        chat_name = (strcmp(msg->dest.receiver, my_login) == 0)
+                    ? msg->sender : msg->dest.receiver;
+        is_group  = 0;
+    }
+
+    int idx = find_or_create_chat(chat_name, is_group);
+    if (idx < 0) { pthread_mutex_unlock(&ui_mutex); return; }
+
+    chat_add_msg(idx, msg->sender, msg->text, msg->timestamp);
+
+    if (active_chat == idx) {
+        struct tm *t = localtime(&msg->timestamp);
+        char tb[10]; strftime(tb, sizeof(tb), "%H:%M", t);
+        if (strcmp(msg->sender, my_login) == 0)
+            printf(GRAY "\n  [%s] " R BOLD GREEN "Вы: " R "%s\n", tb, msg->text);
+        else
+            printf(GRAY "\n  [%s] " R BOLD BLUE "%s: " R "%s\n", tb, msg->sender, msg->text);
+        printf(CLEAR CYAN "> " R);
+        fflush(stdout);
+    } else {
+        chats[idx].unread++;
+        printf(CLEAR YELLOW " [+] Новое от %s в чате \"%s\"" R "\n",
+               msg->sender, chat_name);
+        fflush(stdout);
+    }
+
+    pthread_mutex_unlock(&ui_mutex);
+}
+
+// ════════════════════════════════════════
+//  ЦИКЛЫ НАВИГАЦИИ
+// ════════════════════════════════════════
+static int run_open_chat(int server_fd, int idx);
+
+static void send_sys_cmd(int server_fd, const char *cmd_text)
+{
+    Message msg = {};
+    msg.msg_type  = MSG_SYSTEM;
+    msg.timestamp = time(nullptr);
+    strncpy(msg.sender,        my_login, sizeof(msg.sender) - 1);
+    strncpy(msg.dest.receiver, "server", sizeof(msg.dest.receiver) - 1);
+    snprintf(msg.text, sizeof(msg.text), "%s", cmd_text);
+    send(server_fd, &msg, sizeof(Message), 0);
+}
+
+static int run_chat_list(int server_fd)
+{
+    pthread_mutex_lock(&ui_mutex);
+    active_chat = -1;
+    draw_chat_list();
+    pthread_mutex_unlock(&ui_mutex);
+
+    char buf[1100];
+    while (1) {
+        int len = read_line(buf, sizeof(buf), "> ");
+        if (len < 0) return -1;
+
+        if (strlen(buf) == 0) {
+            pthread_mutex_lock(&ui_mutex);
+            draw_chat_list();
+            pthread_mutex_unlock(&ui_mutex);
+            continue;
+        }
+
+        if (strcmp(buf, "/quit") == 0) return -1;
+
+        // Число → открыть чат
+        char *ep;
+        long num = strtol(buf, &ep, 10);
+        if (*ep == '\0' && num >= 1 && num <= (long)chat_count) {
+            int res = run_open_chat(server_fd, (int)num - 1);
+            if (res == -1) return -1;
+            pthread_mutex_lock(&ui_mutex);
+            active_chat = -1;
+            draw_chat_list();
+            pthread_mutex_unlock(&ui_mutex);
+            continue;
+        }
+
+        // /msg
+        if (strncmp(buf, "/msg ", 5) == 0) {
+            char *rest = buf + 5, *sp = strchr(rest, ' ');
+            if (!sp) { printf(YELLOW "  /msg <логин> <текст>\n" R); continue; }
+            *sp = '\0';
+            pthread_mutex_lock(&ui_mutex);
+            int idx = find_or_create_chat(rest, 0);
+            pthread_mutex_unlock(&ui_mutex);
+            if (idx >= 0 && send_message(server_fd, MSG_PERSONAL, rest, sp+1) == 0) {
+                pthread_mutex_lock(&ui_mutex);
+                chat_add_msg(idx, my_login, sp+1, time(nullptr));
+                pthread_mutex_unlock(&ui_mutex);
+                int res = run_open_chat(server_fd, idx);
+                if (res == -1) return -1;
+                pthread_mutex_lock(&ui_mutex);
+                active_chat = -1;
+                draw_chat_list();
+                pthread_mutex_unlock(&ui_mutex);
+            }
+            continue;
+        }
+
+        // /group
+        if (strncmp(buf, "/group ", 7) == 0) {
+            char *rest = buf + 7, *sp = strchr(rest, ' ');
+            if (!sp) { printf(YELLOW "  /group <группа> <текст>\n" R); continue; }
+            *sp = '\0';
+            pthread_mutex_lock(&ui_mutex);
+            int idx = find_or_create_chat(rest, 1);
+            pthread_mutex_unlock(&ui_mutex);
+            if (idx >= 0 && send_message(server_fd, MSG_GROUP, rest, sp+1) == 0) {
+                pthread_mutex_lock(&ui_mutex);
+                chat_add_msg(idx, my_login, sp+1, time(nullptr));
+                pthread_mutex_unlock(&ui_mutex);
+                int res = run_open_chat(server_fd, idx);
+                if (res == -1) return -1;
+                pthread_mutex_lock(&ui_mutex);
+                active_chat = -1;
+                draw_chat_list();
+                pthread_mutex_unlock(&ui_mutex);
+            }
+            continue;
+        }
+
+        // /newuser <логин> <пароль>
+        if (strncmp(buf, "/newuser ", 9) == 0) {
+            char *rest = buf + 9;
+            char *sp   = strchr(rest, ' ');
+            if (!sp) { printf(YELLOW "  /newuser <логин> <пароль>\n" R); continue; }
+            *sp = '\0';
+            // Имя по умолчанию = логин
+            char cmd[256];
+            snprintf(cmd, sizeof(cmd), "NEWUSER:%s:%s:%s", rest, sp+1, rest);
+            send_sys_cmd(server_fd, cmd);
+            continue;
+        }
+
+        // /newgroup <группа> [участник1] [участник2] ...
+        if (strncmp(buf, "/newgroup ", 10) == 0) {
+            char *rest = buf + 10;
+            // Разбираем: первое слово = имя группы, остальные = участники
+            char *sp = strchr(rest, ' ');
+            char cmd[512];
+            if (sp) {
+                *sp = '\0';
+                // Заменяем пробелы между участниками на :
+                char members[256] = {0};
+                char *tok = strtok(sp + 1, " ");
+                while (tok) {
+                    if (strlen(members) > 0) strcat(members, ":");
+                    strcat(members, tok);
+                    tok = strtok(nullptr, " ");
+                }
+                snprintf(cmd, sizeof(cmd), "NEWGROUP:%s:%s", rest, members);
+            } else {
+                snprintf(cmd, sizeof(cmd), "NEWGROUP:%s", rest);
+            }
+            send_sys_cmd(server_fd, cmd);
+            continue;
+        }
+
+        // /addmember <группа> <логин>
+        if (strncmp(buf, "/addmember ", 11) == 0) {
+            char *rest = buf + 11;
+            char *sp   = strchr(rest, ' ');
+            if (!sp) { printf(YELLOW "  /addmember <группа> <логин>\n" R); continue; }
+            *sp = '\0';
+            char cmd[256];
+            snprintf(cmd, sizeof(cmd), "ADDMEMBER:%s:%s", rest, sp+1);
+            send_sys_cmd(server_fd, cmd);
+            continue;
+        }
+
+        // /users
+        if (strcmp(buf, "/users") == 0) {
+            send_sys_cmd(server_fd, "LISTUSERS");
+            continue;
+        }
+
+        // /groups
+        if (strcmp(buf, "/groups") == 0) {
+            send_sys_cmd(server_fd, "LISTGROUPS");
+            continue;
+        }
+
+        printf(YELLOW "  Введите номер чата или /msg /group /newuser /newgroup /quit\n" R);
+    }
+}
+
+static int run_open_chat(int server_fd, int idx)
+{
+    pthread_mutex_lock(&ui_mutex);
+    active_chat = idx;
+    chats[idx].unread = 0;
+    draw_chat(idx);
+    pthread_mutex_unlock(&ui_mutex);
+
+    char buf[1100];
+    while (1) {
+        int len = read_line(buf, sizeof(buf), "> ");
+        if (len < 0) return -1;
+        if (strcmp(buf, "/quit") == 0) return -1;
+        if (strcmp(buf, "/back") == 0 || len == 0) return 0;
+
+        int msg_type = chats[idx].is_group ? MSG_GROUP : MSG_PERSONAL;
+        if (send_message(server_fd, msg_type, chats[idx].name, buf) == 0) {
+            pthread_mutex_lock(&ui_mutex);
+            time_t now = time(nullptr);
+            chat_add_msg(idx, my_login, buf, now);
+            struct tm *t = localtime(&now);
+            char tb[10]; strftime(tb, sizeof(tb), "%H:%M", t);
+            printf(GRAY "  [%s] " R BOLD GREEN "Вы: " R "%s\n", tb, buf);
+            pthread_mutex_unlock(&ui_mutex);
+        }
+    }
+}
+
+void ui_run(int server_fd)
+{
+    g_server_fd = server_fd;
+    while (run_chat_list(server_fd) != -1);
+}
+
+void ui_cleanup()
+{
+    disable_raw();
+    printf(R "\n");
+    fflush(stdout);
 }
