@@ -302,7 +302,7 @@ static void draw_chat_list()
     printf("\033[2J\033[H");
     printf(BOLD CYAN
         "╔══════════════════════════════════════╗\n"
-        "║  МЕССЕНДЖЕР  —  %s%-20s" CYAN "║\n"
+        "║  МЕССЕНДЖЕР  —  %s%-20s" CYAN " ║\n"
         "╚══════════════════════════════════════╝\n" R,
         GREEN, my_login);
 
@@ -690,6 +690,13 @@ void ui_run(int server_fd)
 void ui_cleanup()
 {
     disable_raw();
+    printf(R "\n");
+    printf(BOLD CYAN
+        "\n"
+        "          ╱|、\n"
+        "        (˚ˎ 。7  \n"
+        "         |、˜〵          \n"
+        "         じしˍ,)ノ\n");
     printf(R "\n");
     fflush(stdout);
 }
