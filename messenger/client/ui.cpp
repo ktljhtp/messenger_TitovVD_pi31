@@ -342,12 +342,8 @@ static void draw_chat(int idx)
     Chat *c = &chats[idx];
     printf("\033[2J\033[H");
 
-    const char *icon = c->is_group ? "👥" : "💬";
-    printf(BOLD CYAN
-        "╔══════════════════════════════════════╗\n"
-        "║  %s %-35s" CYAN "║\n"
-        "╚══════════════════════════════════════╝\n" R,
-        icon, c->name);
+    const char *icon = c->is_group ? "[G]" : "[P]";
+    printf(BOLD CYAN "\n=== %s %s ===\n\n" R, icon, c->name);
 
     if (c->msg_count == 0) {
         printf(GRAY "\n  Нет сообщений\n\n" R);
@@ -451,6 +447,35 @@ void ui_receive_message(const Message *msg)
     }
 
     pthread_mutex_unlock(&ui_mutex);
+}
+
+// ════════════════════════════════════════
+//  АНИМАЦИЯ ЗАПУСКА
+// ════════════════════════════════════════
+static void show_startup_animation()
+{
+    printf("\033[2J\033[H");
+    // ASCII-логотип
+    printf(BOLD CYAN "\n\n"
+    "  ██████╗██╗  ██╗ █████╗ ████████╗██╗██╗  ██╗\n"
+    "  ██╔════╝██║  ██║██╔══██╗╚══██╔══╝██║██║ ██╔╝\n"
+    "  ██║     ███████║███████║   ██║   ██║█████╔╝ \n"
+    "  ██║     ██╔══██║██╔══██║   ██║   ██║██╔═██╗ \n"
+    "  ╚██████╗██║  ██║██║  ██║   ██║   ██║██║  ██╗\n"
+    "   ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝   ╚═╝╚═╝  ╚═╝\n" R
+    );
+
+    fflush(stdout);
+    usleep(500000);
+
+    const char spin[] = "|/-\\";
+    for (int i = 0; i < 12; i++) {
+        printf("\r  Загрузка... %c", spin[i % 4]);
+        fflush(stdout);
+        usleep(80000);
+    }
+    printf("\r\033[K");  // очистить строку
+    usleep(200000);
 }
 
 // ════════════════════════════════════════
@@ -617,6 +642,21 @@ static int run_open_chat(int server_fd, int idx)
     pthread_mutex_lock(&ui_mutex);
     active_chat = idx;
     chats[idx].unread = 0;
+
+    // Для группы запрашиваем историю с сервера при первом открытии
+    // (история личных чатов хранится локально, группы — на сервере)
+    if (chats[idx].is_group && chats[idx].msg_count == 0) {
+        char cmd[128];
+        snprintf(cmd, sizeof(cmd), "GETHISTORY:%s", chats[idx].name);
+        pthread_mutex_unlock(&ui_mutex);
+        send_sys_cmd(server_fd, cmd);
+        // Ждём чуть-чуть пока придут сообщения истории
+        struct timespec ts = {0, 300000000}; // 300мс
+        nanosleep(&ts, nullptr);
+        pthread_mutex_lock(&ui_mutex);
+        active_chat = idx;
+    }
+
     draw_chat(idx);
     pthread_mutex_unlock(&ui_mutex);
 
@@ -643,6 +683,7 @@ static int run_open_chat(int server_fd, int idx)
 void ui_run(int server_fd)
 {
     g_server_fd = server_fd;
+    show_startup_animation();  // <-- добавленная анимация при запуске
     while (run_chat_list(server_fd) != -1);
 }
 

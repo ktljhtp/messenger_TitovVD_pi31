@@ -54,9 +54,17 @@ void *receiver_thread(void *arg)
                 for (char *p = tmp + 8; *p; p++) if (*p == ':') { *p = ' '; }
                 display = tmp;
             }
+            else if (strncmp(text, "HISTORY_START:", 14) == 0) {
+                snprintf(tmp, sizeof(tmp), "История: загружаем %s сообщений...", text + 14);
+                display = tmp;
+            }
+            else if (strcmp(text, "HISTORY_END") == 0)
+                display = nullptr; // тихо — не показываем
+            else if (strcmp(text, "HISTORY_EMPTY") == 0)
+                display = nullptr; // история пуста — молчим
             else display = text; // неизвестное — показываем как есть
 
-            printf("\n\033[33m [!] %s\033[0m\n", display);
+            if (display) { printf("\n\033[33m [!] %s\033[0m\n", display); fflush(stdout); }
             fflush(stdout);
             continue;
         }

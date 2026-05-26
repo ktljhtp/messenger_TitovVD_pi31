@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <time.h>
 #include <signal.h>
+#include <sys/stat.h>
 
 // ──────────────────────────────────────────
 //  Вспомогательная: отправить системный ответ клиенту
@@ -40,6 +41,134 @@ static void save_to_history(const Message *msg)
     if (!f) return;
     fwrite(msg, sizeof(Message), 1, f);
     fclose(f);
+}
+
+
+// ══════════════════════════════════════════
+//  ОФФЛАЙН-ХРАНИЛИЩЕ
+//
+//  data/offline/<логин>.bin — бинарные Message
+//  Если получатель не в сети — пакет сохраняется.
+//  При входе — все пакеты отдаются клиенту.
+// ══════════════════════════════════════════
+
+#define OFFLINE_DIR "data/offline"
+
+static void offline_init()
+{
+    mkdir(OFFLINE_DIR, 0755);
+}
+
+// Сохранить сообщение для оффлайн-получателя
+static void offline_save(const char *login, const Message *msg)
+{
+    char path[128];
+    snprintf(path, sizeof(path), "%s/%s.bin", OFFLINE_DIR, login);
+    FILE *f = fopen(path, "ab");
+    if (!f) return;
+    fwrite(msg, sizeof(Message), 1, f);
+    fclose(f);
+    log_event("Оффлайн-сообщение сохранено для '%s'", login);
+}
+
+// Доставить все накопленные сообщения клиенту при входе
+static void offline_deliver(int client_fd, const char *login)
+{
+    char path[128];
+    snprintf(path, sizeof(path), "%s/%s.bin", OFFLINE_DIR, login);
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+
+    Message msg;
+    int count = 0;
+    while (fread(&msg, sizeof(Message), 1, f) == 1) {
+        send(client_fd, &msg, sizeof(Message), 0);
+        count++;
+    }
+    fclose(f);
+
+    if (count > 0) {
+        // Удаляем файл — сообщения доставлены
+        remove(path);
+        log_event("Доставлено %d оффлайн-сообщений для '%s'", count, login);
+
+        // Уведомляем клиента
+        char note[80];
+        snprintf(note, sizeof(note), "Доставлено %d пропущенных сообщений", count);
+        Message sys = {};
+        sys.msg_type  = MSG_SYSTEM;
+        sys.timestamp = time(nullptr);
+        strncpy(sys.sender,        "server", sizeof(sys.sender) - 1);
+        strncpy(sys.dest.receiver, login,    sizeof(sys.dest.receiver) - 1);
+        snprintf(sys.text, sizeof(sys.text), "%s", note);
+        send(client_fd, &sys, sizeof(Message), 0);
+    }
+}
+
+
+// ══════════════════════════════════════════
+//  ИСТОРИЯ ГРУПП
+//
+//  data/group_history/<группа>.bin
+//  Хранит последние сообщения группы.
+//  При запросе GETHISTORY отдаёт последние N.
+// ══════════════════════════════════════════
+
+#define GROUP_HISTORY_DIR "data/group_history"
+#define GROUP_HISTORY_MAX 50  // максимум сообщений в ответе
+
+static void group_history_init()
+{
+    mkdir(GROUP_HISTORY_DIR, 0755);
+}
+
+// Сохранить сообщение в историю группы
+static void group_history_save(const Message *msg)
+{
+    char path[128];
+    snprintf(path, sizeof(path), "%s/%s.bin",
+             GROUP_HISTORY_DIR, msg->dest.group_name);
+    FILE *f = fopen(path, "ab");
+    if (!f) return;
+    fwrite(msg, sizeof(Message), 1, f);
+    fclose(f);
+}
+
+// Отправить историю группы клиенту (последние GROUP_HISTORY_MAX сообщений)
+static void group_history_send(int client_fd, const char *login,
+                                const char *group_name)
+{
+    char path[128];
+    snprintf(path, sizeof(path), "%s/%s.bin", GROUP_HISTORY_DIR, group_name);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        send_sys(client_fd, login, "HISTORY_EMPTY");
+        return;
+    }
+
+    // Считаем сколько сообщений в файле
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    long total     = file_size / (long)sizeof(Message);
+
+    // Начинаем с позиции чтобы отдать не более GROUP_HISTORY_MAX
+    long start = total > GROUP_HISTORY_MAX ? total - GROUP_HISTORY_MAX : 0;
+    fseek(f, (long)(start * sizeof(Message)), SEEK_SET);
+
+    // Уведомляем клиента что начинается история
+    char note[64];
+    snprintf(note, sizeof(note), "HISTORY_START:%ld", total - start);
+    send_sys(client_fd, login, note);
+
+    Message msg;
+    while (fread(&msg, sizeof(Message), 1, f) == 1)
+        send(client_fd, &msg, sizeof(Message), 0);
+
+    fclose(f);
+
+    send_sys(client_fd, login, "HISTORY_END");
+    log_event("История группы '%s' отправлена '%s' (%ld сообщений)",
+              group_name, login, total - start);
 }
 
 // ──────────────────────────────────────────
@@ -301,6 +430,8 @@ static void handle_system_command(int client_fd, const char *login,
         cmd_listgroups(client_fd, login);
     else if (strcmp(text, "USERS") == 0 || strcmp(text, "LISTUSERS") == 0)
         cmd_listusers(client_fd, login);
+    else if (strncmp(text, "GETHISTORY:", 11) == 0)
+        group_history_send(client_fd, login, text + 11);
     else
         log_event("Неизвестная системная команда от '%s': %s", login, text);
 }
@@ -315,8 +446,9 @@ int route_message(const Message *msg)
         snprintf(fifo_path, sizeof(fifo_path), FIFO_PATH, msg->dest.receiver);
         int fd = open(fifo_path, O_WRONLY | O_NONBLOCK);
         if (fd < 0) {
-            log_event("Получатель %s не в сети", msg->dest.receiver);
-            return -1;
+            log_event("Получатель %s не в сети — сохраняем оффлайн", msg->dest.receiver);
+            offline_save(msg->dest.receiver, msg);
+            return 0; // 0 = доставлено (отложенно)
         }
         ssize_t w = write(fd, msg, sizeof(Message));
         close(fd);
@@ -340,7 +472,12 @@ int route_message(const Message *msg)
                 char fifo_path[FIFO_MAXPATH];
                 snprintf(fifo_path, sizeof(fifo_path), FIFO_PATH, member);
                 int fd = open(fifo_path, O_WRONLY | O_NONBLOCK);
-                if (fd < 0) continue;
+                if (fd < 0) {
+                    // Участник не в сети — сохраняем оффлайн
+                    offline_save(member, msg);
+                    delivered++; // считаем как доставленное
+                    continue;
+                }
                 write(fd, msg, sizeof(Message));
                 close(fd);
                 delivered++;
@@ -371,6 +508,11 @@ void handle_client(int client_fd, struct sockaddr_in addr)
         return;
     }
     log_event("Пользователь '%s' вошёл (%s)", login, client_ip);
+
+    // Создаём папку оффлайн-хранилища и доставляем накопленные сообщения
+    offline_init();
+    group_history_init();
+    offline_deliver(client_fd, login);
 
     char fifo_path[FIFO_MAXPATH];
     snprintf(fifo_path, sizeof(fifo_path), FIFO_PATH, login);
@@ -416,16 +558,15 @@ void handle_client(int client_fd, struct sockaddr_in addr)
                 handle_system_command(client_fd, login, &msg);
             } else {
                 save_to_history(&msg);
+                // Дополнительно сохраняем групповые сообщения отдельно
+                if (msg.msg_type == MSG_GROUP)
+                    group_history_save(&msg);
                 if (route_message(&msg) < 0) {
+                    // Группа не найдена (route вернул -1 только для неизвестных групп)
                     char errtext[256];
-                    if (msg.msg_type == MSG_PERSONAL)
-                        snprintf(errtext, sizeof(errtext),
-                                 "Пользователь '%s' не в сети",
-                                 msg.dest.receiver);
-                    else
-                        snprintf(errtext, sizeof(errtext),
-                                 "Группа '%s' недоступна или нет участников онлайн",
-                                 msg.dest.group_name);
+                    snprintf(errtext, sizeof(errtext),
+                             "Группа '%s' не найдена в groups.dat",
+                             msg.dest.group_name);
                     send_sys(client_fd, login, errtext);
                 }
             }
