@@ -5,6 +5,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 
 #include <openssl/evp.h>
 #include <openssl/sha.h>
@@ -59,6 +60,52 @@ static int user_exists(const char *login)
     }
     fclose(f);
     return 0;
+}
+
+// ══════════════════════════════════════════
+//  МЕХАНИЗМ ЗАМКОВ (online lock)
+//
+//  При входе создаётся файл data/online/<логин>.lock
+//  При выходе файл удаляется.
+//  Если файл уже существует — пользователь онлайн,
+//  повторный вход заблокирован.
+//
+//  Папка: data/online/
+// ══════════════════════════════════════════
+#define ONLINE_DIR "data/online"
+
+// Сформировать путь к lock-файлу
+static void lock_path(char *out, int maxlen, const char *login)
+{
+    snprintf(out, maxlen, "%s/%s.lock", ONLINE_DIR, login);
+}
+
+// Проверить — залогинен ли пользователь сейчас
+static int is_online(const char *login)
+{
+    char path[128];
+    lock_path(path, sizeof(path), login);
+    return access(path, F_OK) == 0; // F_OK: просто проверяем существование
+}
+
+// Создать lock-файл (пользователь вошёл)
+static int lock_create(const char *login)
+{
+    mkdir(ONLINE_DIR, 0755); // создаём папку если нет
+    char path[128];
+    lock_path(path, sizeof(path), login);
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    fclose(f);
+    return 0;
+}
+
+// Удалить lock-файл (пользователь вышел)
+void lock_remove(const char *login)
+{
+    char path[128];
+    lock_path(path, sizeof(path), login);
+    unlink(path);
 }
 
 // ──────────────────────────────────────────
@@ -139,7 +186,7 @@ static int register_user(int client_fd, char *out_login)
 //    → "<логин>\n"
 //    ← "PASSWORD\n"
 //    → "<пароль>\n"
-//    ← "OK\n" / "FAIL\n"
+//    ← "OK\n" / "FAIL\n" / "LOCKED\n"
 //
 //  Ветка REGISTER:
 //    ← "REG_LOGIN\n"
@@ -161,7 +208,9 @@ int authenticate(int client_fd, char *out_login)
     if (strcmp(intent, "REGISTER") == 0) {
         int res = register_user(client_fd, out_login);
         if (res < 0) return -1;
-        // После успешной регистрации сразу считаем пользователя вошедшим
+
+        // Создаём lock-файл для нового пользователя
+        lock_create(out_login);
         log_event("Пользователь '%s' вошёл после регистрации", out_login);
         return 0;
     }
@@ -200,15 +249,24 @@ int authenticate(int client_fd, char *out_login)
     }
     fclose(f);
 
-    if (found) {
-        send(client_fd, "OK\n", 3, 0);
-        strncpy(out_login, login, 31);
-        out_login[31] = '\0';
-        log_event("Аутентификация успешна: %s", login);
-        return 0;
-    } else {
+    if (!found) {
         send(client_fd, "FAIL\n", 5, 0);
         log_event("Ошибка аутентификации: %s", login);
         return -1;
     }
+
+    // Проверяем — не залогинен ли уже этот пользователь
+    if (is_online(login)) {
+        send(client_fd, "LOCKED\n", 7, 0);
+        log_event("Заблокирован повторный вход: %s уже онлайн", login);
+        return -1;
+    }
+
+    // Всё ок — создаём lock и пускаем
+    lock_create(login);
+    send(client_fd, "OK\n", 3, 0);
+    strncpy(out_login, login, 31);
+    out_login[31] = '\0';
+    log_event("Аутентификация успешна: %s", login);
+    return 0;
 }

@@ -583,5 +583,6 @@ void handle_client(int client_fd, struct sockaddr_in addr)
     close(fifo_fd);
     unlink(fifo_path);
     close(client_fd);
+    lock_remove(login); // снимаем блокировку — пользователь вышел
     log_event("Сессия '%s' завершена", login);
 }

@@ -17,7 +17,8 @@
 //   ищет совпадение в users.dat по SHA-256 хешу.
 //   При успехе: записывает логин в out_login (буфер ≥ 32 байт),
 //   возвращает 0.
-//   При ошибке (неверный пароль / нет пользователя): возвращает -1.
+//   При ошибке (неверный пароль / нет пользователя / уже онлайн):
+//   возвращает -1.
 int authenticate(int client_fd, char *out_login);
 
 // hash_password — возвращает указатель на статический буфер
@@ -25,3 +26,7 @@ int authenticate(int client_fd, char *out_login);
 //   НЕ потокобезопасна — вызывать только до fork() или только
 //   в одном процессе за раз.
 const char *hash_password(const char *password);
+
+// lock_remove — удаляет lock-файл пользователя при выходе.
+//   Вызывать из session.cpp когда клиент отключается.
+void lock_remove(const char *login);
