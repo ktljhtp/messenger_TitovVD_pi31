@@ -38,7 +38,7 @@
 - Утилиты `make`, `bash`
 
 Установка зависимостей на Ubuntu/Debian:
-
+```bash
 sudo apt install build-essential libssl-dev
 
 ###Сборка
