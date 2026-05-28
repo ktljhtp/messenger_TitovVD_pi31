@@ -12,8 +12,9 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <ifaddrs.h>      // getifaddrs — список сетевых интерфейсов
-#include <net/if.h>       // IFF_LOOPBACK, IFF_UP
+#include <dirent.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 // ──────────────────────────────────────────
 //  Глобальные переменные
@@ -23,7 +24,8 @@
 // ──────────────────────────────────────────
 static volatile int active_children = 0;
 static pid_t children_pids[MAX_CLIENTS] = {0};
-static int   server_fd = -1; // глобально для доступа из обработчиков
+static int   server_fd  = -1; // глобально для доступа из обработчиков
+static int   child_client_fd = -1; // fd клиента в дочернем процессе
 
 // ──────────────────────────────────────────
 //  add_child / remove_child — управление массивом PID
@@ -100,6 +102,43 @@ static void sigterm_handler(int /*sig*/)
     exit(0);
 }
 
+
+// ──────────────────────────────────────────
+//  sigusr1_handler — перечитывание конфигурации
+//
+//  Сигнал: kill -USR1 <PID сервера>
+//  Действие: сервер перечитывает data/users.dat и
+//  data/groups.dat без перезапуска.
+//  Изменения применяются для следующих подключений.
+//  Уже подключённые клиенты не затрагиваются.
+// ──────────────────────────────────────────
+static volatile int reload_requested = 0;
+
+static void sigusr1_handler(int /*sig*/)
+{
+    reload_requested = 1; // атомарный флаг — обрабатываем в основном цикле
+}
+
+static void do_reload()
+{
+    reload_requested = 0;
+    // Проверяем что файлы конфигурации доступны
+    FILE *fu = fopen("data/users.dat", "r");
+    FILE *fg = fopen("data/groups.dat", "r");
+
+    if (fu && fg) {
+        fclose(fu);
+        fclose(fg);
+        log_event("RELOAD: конфигурация перечитана (users.dat, groups.dat)");
+        printf("\033[32m[server] Конфигурация перечитана (SIGUSR1)\033[0m\n");
+    } else {
+        log_event("RELOAD: ошибка — файлы конфигурации недоступны");
+        printf("\033[31m[server] Ошибка перечитывания конфигурации\033[0m\n");
+        if (fu) fclose(fu);
+        if (fg) fclose(fg);
+    }
+}
+
 // ──────────────────────────────────────────
 //  sighup_child_handler
 //
@@ -109,9 +148,22 @@ static void sigterm_handler(int /*sig*/)
 // ──────────────────────────────────────────
 static void sighup_child_handler(int /*sig*/)
 {
-    // Этот обработчик устанавливается в дочернем процессе
-    // Реальное уведомление клиента делается в session.cpp
-    // Здесь просто выходим — cleanup произойдёт в handle_client
+    // Отправляем клиенту правильную структуру Message с системным уведомлением.
+    // Клиент ожидает ровно sizeof(Message) байт — нельзя слать произвольную строку.
+    if (child_client_fd >= 0) {
+        Message msg = {};
+        msg.msg_type  = MSG_SYSTEM;
+        msg.timestamp = time(nullptr);
+        strncpy(msg.sender,        "server",           sizeof(msg.sender) - 1);
+        strncpy(msg.dest.receiver, "client",           sizeof(msg.dest.receiver) - 1);
+        strncpy(msg.text,          "Сервер пал, милорд. Соединение разорвано.",
+                sizeof(msg.text) - 1);
+
+        // MSG_NOSIGNAL — не генерировать SIGPIPE если клиент уже закрыл сокет
+        send(child_client_fd, &msg, sizeof(Message), MSG_NOSIGNAL);
+        close(child_client_fd);
+        child_client_fd = -1;
+    }
     _exit(0);
 }
 
@@ -156,76 +208,96 @@ static int create_server_socket(int port)
 }
 
 // ──────────────────────────────────────────
-//  print_server_addresses
-//
-//  Печатает все IP-адреса машины на которых
-//  доступен сервер. Клиент должен использовать
-//  адрес из той же сети что и он сам:
-//    127.0.0.1   — только с этой же машины
-//    192.168.x.x — локальная сеть / ВМ в одной сети
-//    172.x.x.x   — WSL / Docker сеть
-//
-//  Использует getifaddrs() — стандартный POSIX вызов.
-// ──────────────────────────────────────────
-static void print_server_addresses(int port)
-{
-    printf("\033[1m\033[36m"); // BOLD CYAN
-    printf("┌─────────────────────────────────────────┐\n");
-    printf("│         АДРЕСА ДЛЯ ПОДКЛЮЧЕНИЯ          │\n");
-    printf("└─────────────────────────────────────────┘\n");
-    printf("\033[0m"); // RESET
-
-    struct ifaddrs *ifaddr = nullptr;
-    if (getifaddrs(&ifaddr) == -1) {
-        // Fallback если getifaddrs не сработал
-        printf("  \033[33mНе удалось определить адреса. Узнай вручную: ip a\033[0m\n\n");
-        return;
-    }
-
-    int printed = 0;
-    for (struct ifaddrs *ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
-        // Пропускаем интерфейсы без адреса
-        if (ifa->ifa_addr == nullptr) continue;
-        // Только IPv4
-        if (ifa->ifa_addr->sa_family != AF_INET) continue;
-        // Пропускаем выключенные интерфейсы
-        if (!(ifa->ifa_flags & IFF_UP)) continue;
-
-        struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
-        char ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &sa->sin_addr, ip, sizeof(ip));
-
-        // Определяем тип адреса для подсказки
-        const char *hint = "";
-        const char *color = "\033[32m"; // GREEN по умолчанию
-
-        if (strcmp(ifa->ifa_name, "lo") == 0 ||
-            strncmp(ip, "127.", 4) == 0) {
-            hint  = "  ← только с этой машины";
-            color = "\033[90m"; // GRAY — наименее полезный
-        } else if (strncmp(ip, "192.168.", 8) == 0 ||
-                   strncmp(ip, "10.",      3) == 0) {
-            hint  = "  ← локальная сеть (рекомендуется)";
-            color = "\033[32m"; // GREEN
-        } else if (strncmp(ip, "172.", 4) == 0) {
-            hint  = "  ← WSL / Docker / VPN";
-            color = "\033[33m"; // YELLOW
-        }
-
-        printf("  %s%-15s\033[0m : \033[1m%d\033[0m%s\n",
-               color, ip, port, hint);
-        printed++;
-    }
-
-    freeifaddrs(ifaddr);
-
-    if (printed == 0)
-        printf("  \033[33mАдреса не найдены. Узнай вручную: ip a\033[0m\n");
-}
-
-// ──────────────────────────────────────────
 //  main
 // ──────────────────────────────────────────
+
+
+// ──────────────────────────────────────────
+//  broadcast_reauth
+//
+//  Вызывается при старте сервера.
+//  Сканирует /tmp/fifo_* — это FIFO активных
+//  клиентских сессий от предыдущего запуска.
+//  Отправляет каждому Message с требованием
+//  переавторизации, затем удаляет FIFO.
+//
+//  После этого клиенты увидят сообщение и
+//  получат EOF — их receiver_thread завершится.
+// ──────────────────────────────────────────
+static void broadcast_reauth()
+{
+    DIR *dir = opendir("/tmp");
+    if (!dir) return;
+
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        // Ищем файлы вида fifo_<логин>
+        if (strncmp(entry->d_name, "fifo_", 5) != 0) continue;
+
+        char path[300];
+        snprintf(path, sizeof(path), "/tmp/%s", entry->d_name);
+
+        // Проверяем что это именно FIFO
+        struct stat st;
+        if (stat(path, &st) < 0 || !S_ISFIFO(st.st_mode)) continue;
+
+        // Открываем FIFO без блокировки
+        int fd = open(path, O_WRONLY | O_NONBLOCK);
+        if (fd < 0) {
+            // Нет читателя — клиент уже отключён, просто удаляем
+            unlink(path);
+            continue;
+        }
+
+        // Формируем системное сообщение
+        Message msg = {};
+        msg.msg_type  = MSG_SYSTEM;
+        msg.timestamp = time(nullptr);
+        strncpy(msg.sender,        "server",  sizeof(msg.sender) - 1);
+        strncpy(msg.dest.receiver, entry->d_name + 5, // имя без "fifo_"
+                sizeof(msg.dest.receiver) - 1);
+        strncpy(msg.text,
+                "Сервер был перезапущен. Требуется переавторизация.",
+                sizeof(msg.text) - 1);
+
+        write(fd, &msg, sizeof(Message));
+        close(fd);
+        unlink(path); // удаляем FIFO — клиент получит EOF и отключится
+        count++;
+    }
+    closedir(dir);
+
+    if (count > 0) {
+        printf("\033[33m[server] Отправлено уведомление о перезапуске %d клиентам\033[0m\n",
+               count);
+        log_event("Старт: уведомлено %d активных клиентов о перезапуске", count);
+    }
+}
+
+static void clear_online_locks()
+{
+    mkdir("data/online", 0755);
+    DIR *dir = opendir("data/online");
+    if (!dir) return;
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (entry->d_name[0] == '.') continue;
+        char *dot = strrchr(entry->d_name, '.');
+        if (!dot || strcmp(dot, ".lock") != 0) continue;
+        char path[300];
+        snprintf(path, sizeof(path), "data/online/%s", entry->d_name);
+        unlink(path);
+        count++;
+    }
+    closedir(dir);
+    if (count > 0) {
+        printf("\033[90m[server] Очищено %d устаревших lock-файлов\033[0m\n", count);
+        log_event("Старт: очищено %d устаревших lock-файлов", count);
+    }
+}
+
 int main(int argc, char *argv[])
 {
     int port = DEFAULT_PORT;
@@ -241,6 +313,12 @@ int main(int argc, char *argv[])
     log_open("data/server.log");
     log_event("Сервер запускается на порту %d", port);
 
+    // Уведомляем клиентов предыдущей сессии о перезапуске
+    broadcast_reauth();
+
+    // Чистим устаревшие lock-файлы от предыдущего запуска
+    clear_online_locks();
+
     // Устанавливаем обработчики сигналов
     struct sigaction sa_chld = {};
     sa_chld.sa_handler = sigchld_handler;
@@ -254,6 +332,13 @@ int main(int argc, char *argv[])
     sigaction(SIGTERM, &sa_term, nullptr);
     sigaction(SIGINT,  &sa_term, nullptr); // Ctrl+C тоже корректно завершает
 
+    // SIGUSR1 — перечитывание конфигурации без перезапуска
+    struct sigaction sa_usr1 = {};
+    sa_usr1.sa_handler = sigusr1_handler;
+    sigemptyset(&sa_usr1.sa_mask);
+    sa_usr1.sa_flags = 0; // без SA_RESTART — чтобы accept прерывался и мы проверили флаг
+    sigaction(SIGUSR1, &sa_usr1, nullptr);
+
     // Создаём слушающий сокет
     server_fd = create_server_socket(port);
     if (server_fd < 0) {
@@ -262,11 +347,9 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // Печатаем адреса для подключения
-    print_server_addresses(port);
-
     log_event("Сервер готов, ожидаем подключений...");
     printf("[server] Запущен на порту %d. Лог: data/server.log\n", port);
+    printf("\033[90m[server] Reload конфига: kill -USR1 %d\033[0m\n", getpid());
 
     // ── Основной цикл accept() ──
     while (1) {
@@ -277,7 +360,11 @@ int main(int argc, char *argv[])
                                (struct sockaddr *)&client_addr,
                                &addr_len);
         if (client_fd < 0) {
-            if (errno == EINTR) continue; // прерван сигналом — нормально
+            if (errno == EINTR) {
+                // Прерван сигналом — проверяем нужен ли reload
+                if (reload_requested) do_reload();
+                continue;
+            }
             log_event("accept() ошибка: %s", strerror(errno));
             continue;
         }
@@ -307,8 +394,13 @@ int main(int argc, char *argv[])
             // Закрываем слушающий сокет (нам он не нужен)
             close(server_fd);
 
+            // Сохраняем fd клиента глобально для sighup_child_handler
+            child_client_fd = client_fd;
+
             // В дочернем устанавливаем обработчик SIGHUP
             signal(SIGHUP, sighup_child_handler);
+            // Дочернему SIGUSR1 не нужен — сбрасываем на дефолт
+            signal(SIGUSR1, SIG_DFL);
 
             // Обслуживаем клиента (блокирующий вызов до разрыва)
             handle_client(client_fd, client_addr);

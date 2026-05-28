@@ -520,27 +520,51 @@ void handle_client(int client_fd, struct sockaddr_in addr)
 
     if (mkfifo(fifo_path, 0666) < 0) {
         log_event("ОШИБКА mkfifo для %s: %s", login, strerror(errno));
+        lock_remove(login);
         close(client_fd); return;
     }
 
     int fifo_fd = open(fifo_path, O_RDWR | O_NONBLOCK);
     if (fifo_fd < 0) {
         log_event("ОШИБКА open FIFO для %s: %s", login, strerror(errno));
-        unlink(fifo_path); close(client_fd); return;
+        unlink(fifo_path);
+        lock_remove(login);
+        close(client_fd); return;
     }
 
     Message msg;
     fd_set read_fds;
     int maxfd = (client_fd > fifo_fd ? client_fd : fifo_fd) + 1;
 
+#define INACTIVITY_TIMEOUT_SEC (5 * 60)  // 5 минут без активности → отключение
+
     while (1) {
         FD_ZERO(&read_fds);
         FD_SET(client_fd, &read_fds);
         FD_SET(fifo_fd,   &read_fds);
 
-        int ready = select(maxfd, &read_fds, nullptr, nullptr, nullptr);
+        struct timeval tv;
+        tv.tv_sec  = INACTIVITY_TIMEOUT_SEC;
+        tv.tv_usec = 0;
+
+        int ready = select(maxfd, &read_fds, nullptr, nullptr, &tv);
         if (ready < 0) {
             if (errno == EINTR) continue;
+            break;
+        }
+
+        // Таймаут — клиент неактивен 5 минут
+        if (ready == 0) {
+            log_event("Таймаут неактивности для '%s' — отключение", login);
+            Message timeout_msg = {};
+            timeout_msg.msg_type  = MSG_SYSTEM;
+            timeout_msg.timestamp = time(nullptr);
+            strncpy(timeout_msg.sender,        "server", sizeof(timeout_msg.sender) - 1);
+            strncpy(timeout_msg.dest.receiver, login,    sizeof(timeout_msg.dest.receiver) - 1);
+            strncpy(timeout_msg.text,
+                    "Отключено по таймауту неактивности (5 минут).",
+                    sizeof(timeout_msg.text) - 1);
+            send(client_fd, &timeout_msg, sizeof(Message), MSG_NOSIGNAL);
             break;
         }
 
@@ -583,6 +607,6 @@ void handle_client(int client_fd, struct sockaddr_in addr)
     close(fifo_fd);
     unlink(fifo_path);
     close(client_fd);
-    lock_remove(login); // снимаем блокировку — пользователь вышел
+    lock_remove(login);  // снимаем блокировку при любом выходе
     log_event("Сессия '%s' завершена", login);
 }

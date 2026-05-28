@@ -19,6 +19,9 @@
 #define RETRY_BEFORE_ASK    3
 
 typedef struct { int server_fd; } ReceiverArgs;
+
+// Глобальный fd — нужен обработчику сигнала для отправки logout
+static volatile int g_server_fd = -1;
 void *receiver_thread(void *arg);
 void *sender_thread(void *arg);
 
@@ -30,6 +33,31 @@ void *sender_thread(void *arg);
 #define YELLOW "\033[33m"
 #define RED    "\033[31m"
 #define GRAY   "\033[90m"
+
+
+// ──────────────────────────────────────────
+//  client_signal_handler
+//
+//  Перехватываем SIGTERM и SIGINT (Ctrl+C)
+//  и kill терминала чтобы корректно закрыть
+//  соединение и снять lock на сервере.
+//
+//  Сервер обнаружит разрыв TCP через recv()
+//  вернёт 0, вызовет lock_remove и очистится.
+// ──────────────────────────────────────────
+static void client_signal_handler(int /*sig*/)
+{
+    // Закрываем сокет — сервер получит EOF на recv()
+    // и сам вызовет lock_remove для нашего логина
+    if (g_server_fd >= 0) {
+        shutdown(g_server_fd, SHUT_RDWR);
+        close(g_server_fd);
+        g_server_fd = -1;
+    }
+    // Восстанавливаем терминал если был raw-режим
+    // (tcsetattr вызывается в ui_cleanup через atexit)
+    _exit(0);
+}
 
 // ──────────────────────────────────────────
 //  Чтение client.conf
@@ -413,6 +441,16 @@ int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
 
+    // Перехватываем сигналы завершения для корректного выхода
+    // (снятие lock-файла на сервере через закрытие TCP-соединения)
+    struct sigaction sa_exit = {};
+    sa_exit.sa_handler = client_signal_handler;
+    sigemptyset(&sa_exit.sa_mask);
+    sa_exit.sa_flags = 0;
+    sigaction(SIGTERM, &sa_exit, nullptr);  // kill <pid>
+    sigaction(SIGINT,  &sa_exit, nullptr);  // Ctrl+C
+    sigaction(SIGHUP,  &sa_exit, nullptr);  // закрытие терминала
+
     char server_ip[64] = {0};
     int  server_port   = DEFAULT_SERVER_PORT;
     load_config(server_ip, sizeof(server_ip), &server_port);
@@ -426,6 +464,7 @@ int main(void)
         return 0;
     }
 
+    g_server_fd = server_fd;  // для обработчика сигнала
     printf(GREEN BOLD "\n  Добро пожаловать, %s!\n\n" R, login);
     sleep(1);
 
