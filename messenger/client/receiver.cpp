@@ -5,6 +5,8 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <stdio.h>
+#include <unistd.h>
+#include <stdlib.h>
 
 typedef struct { int server_fd; } ReceiverArgs;
 
@@ -62,10 +64,36 @@ void *receiver_thread(void *arg)
                 display = nullptr; // тихо — не показываем
             else if (strcmp(text, "HISTORY_EMPTY") == 0)
                 display = nullptr; // история пуста — молчим
+            else if (strncmp(text, "GROUP_ADDED:", 12) == 0) {
+                // Создаём чат группы сразу — без ожидания первого сообщения
+                const char *gname = text + 12;
+                ui_receive_group_added(gname);
+                snprintf(tmp, sizeof(tmp), "Вас добавили в группу: %s", gname);
+                display = tmp;
+            }
             else display = text; // неизвестное — показываем как есть
 
             if (display) { printf("\n\033[33m [!] %s\033[0m\n", display); fflush(stdout); }
             fflush(stdout);
+
+            // Сообщения требующие завершения клиента:
+            // таймаут неактивности или перезапуск сервера
+            int should_exit = 0;
+            if (strstr(text, "таймаут") || strstr(text, "Таймаут") ||
+                strstr(text, "неактивност") || strstr(text, "TIMEOUT"))
+                should_exit = 1;
+            if (strstr(text, "перезапущен") || strstr(text, "переавтор") ||
+                strstr(text, "пал, милорд"))
+                should_exit = 1;
+
+            if (should_exit) {
+                printf("\n\033[90m Выход через 3 секунды...\033[0m\n");
+                fflush(stdout);
+                sleep(3);
+                ui_cleanup();
+                exit(0);
+            }
+
             continue;
         }
 

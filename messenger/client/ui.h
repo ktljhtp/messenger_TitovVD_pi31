@@ -10,6 +10,10 @@
 // login — логин текущего пользователя (для заголовков)
 void ui_init(const char *login);
 
+// Вызывается когда сервер добавил нас в новую группу
+// Создаёт чат группы в списке если его ещё нет
+void ui_receive_group_added(const char *group_name);
+
 // Вызывается из receiver_thread при получении сообщения
 // Добавляет в нужный чат и показывает уведомление если чат не открыт
 void ui_receive_message(const Message *msg);

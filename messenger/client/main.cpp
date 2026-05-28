@@ -460,7 +460,6 @@ int main(void)
     int server_fd = auth_menu(server_ip, sizeof(server_ip),
                               &server_port, login);
     if (server_fd < 0) {
-        printf("До свидания!\n");
         return 0;
     }
 

@@ -231,6 +231,35 @@ static int find_or_create_chat(const char *name, int is_group)
 }
 
 // ════════════════════════════════════════
+//  АНИМАЦИЯ ЗАПУСКА
+// ════════════════════════════════════════
+static void show_startup_animation()
+{
+    printf("\033[2J\033[H");
+    // ASCII-логотип
+    printf(BOLD CYAN "\n\n"
+    "  ██████╗██╗  ██╗ █████╗ ████████╗██╗██╗  ██╗\n"
+    "  ██╔════╝██║  ██║██╔══██╗╚══██╔══╝██║██║ ██╔╝\n"
+    "  ██║     ███████║███████║   ██║   ██║█████╔╝ \n"
+    "  ██║     ██╔══██║██╔══██║   ██║   ██║██╔═██╗ \n"
+    "  ╚██████╗██║  ██║██║  ██║   ██║   ██║██║  ██╗\n"
+    "   ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝   ╚═╝╚═╝  ╚═╝\n" R
+    );
+
+    fflush(stdout);
+    usleep(500000);
+
+    const char spin[] = "|/-\\";
+    for (int i = 0; i < 12; i++) {
+        printf("\r  Загрузка... %c", spin[i % 4]);
+        fflush(stdout);
+        usleep(80000);
+    }
+    printf("\r\033[K");  // очистить строку
+    usleep(200000);
+}
+
+// ════════════════════════════════════════
 //  ВВОД СТРОКИ (raw-режим, UTF-8)
 // ════════════════════════════════════════
 static int read_line(char *buf, int maxlen, const char *prompt)
@@ -302,7 +331,7 @@ static void draw_chat_list()
     printf("\033[2J\033[H");
     printf(BOLD CYAN
         "╔══════════════════════════════════════╗\n"
-        "║  МЕССЕНДЖЕР  —  %s%-20s" CYAN " ║\n"
+        "║  МЕССЕНДЖЕР  —  %s%-20s" CYAN "║\n"
         "╚══════════════════════════════════════╝\n" R,
         GREEN, my_login);
 
@@ -342,8 +371,12 @@ static void draw_chat(int idx)
     Chat *c = &chats[idx];
     printf("\033[2J\033[H");
 
-    const char *icon = c->is_group ? "[G]" : "[P]";
-    printf(BOLD CYAN "\n=== %s %s ===\n\n" R, icon, c->name);
+    const char *icon = c->is_group ? "👥" : "💬";
+    printf(BOLD CYAN
+        "╔══════════════════════════════════════╗\n"
+        "║  %s %-35s" CYAN "║\n"
+        "╚══════════════════════════════════════╝\n" R,
+        icon, c->name);
 
     if (c->msg_count == 0) {
         printf(GRAY "\n  Нет сообщений\n\n" R);
@@ -410,6 +443,14 @@ void ui_init(const char *login)
     history_init();
 }
 
+void ui_receive_group_added(const char *group_name)
+{
+    pthread_mutex_lock(&ui_mutex);
+    find_or_create_chat(group_name, 1);
+    pthread_mutex_unlock(&ui_mutex);
+}
+
+
 void ui_receive_message(const Message *msg)
 {
     pthread_mutex_lock(&ui_mutex);
@@ -447,35 +488,6 @@ void ui_receive_message(const Message *msg)
     }
 
     pthread_mutex_unlock(&ui_mutex);
-}
-
-// ════════════════════════════════════════
-//  АНИМАЦИЯ ЗАПУСКА
-// ════════════════════════════════════════
-static void show_startup_animation()
-{
-    printf("\033[2J\033[H");
-    // ASCII-логотип
-    printf(BOLD CYAN "\n\n"
-    "  ██████╗██╗  ██╗ █████╗ ████████╗██╗██╗  ██╗\n"
-    "  ██╔════╝██║  ██║██╔══██╗╚══██╔══╝██║██║ ██╔╝\n"
-    "  ██║     ███████║███████║   ██║   ██║█████╔╝ \n"
-    "  ██║     ██╔══██║██╔══██║   ██║   ██║██╔═██╗ \n"
-    "  ╚██████╗██║  ██║██║  ██║   ██║   ██║██║  ██╗\n"
-    "   ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝   ╚═╝╚═╝  ╚═╝\n" R
-    );
-
-    fflush(stdout);
-    usleep(500000);
-
-    const char spin[] = "|/-\\";
-    for (int i = 0; i < 12; i++) {
-        printf("\r  Загрузка... %c", spin[i % 4]);
-        fflush(stdout);
-        usleep(80000);
-    }
-    printf("\r\033[K");  // очистить строку
-    usleep(200000);
 }
 
 // ════════════════════════════════════════
@@ -692,11 +704,11 @@ void ui_cleanup()
     disable_raw();
     printf(R "\n");
     printf(BOLD CYAN
-        "\n"
-        "          ╱|、\n"
-        "        (˚ˎ 。7  \n"
-        "         |、˜〵          \n"
-        "         じしˍ,)ノ\n");
+    "\n"
+    "          ╱|、\n"
+    "        (˚ˎ 。7  \n"
+    "         |、˜〵          \n"
+    "         じしˍ,)ノ\n");
     printf(R "\n");
     fflush(stdout);
 }

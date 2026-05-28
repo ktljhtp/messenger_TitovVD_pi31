@@ -15,6 +15,8 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 
 // ──────────────────────────────────────────
 //  Глобальные переменные
@@ -207,9 +209,7 @@ static int create_server_socket(int port)
     return fd;
 }
 
-// ──────────────────────────────────────────
-//  main
-// ──────────────────────────────────────────
+
 
 
 // ──────────────────────────────────────────
@@ -298,6 +298,59 @@ static void clear_online_locks()
     }
 }
 
+// ──────────────────────────────────────────
+//  print_server_addresses
+//
+//  Печатает все IP-адреса на которых доступен
+//  сервер. Клиент указывает один из них в client.conf.
+// ──────────────────────────────────────────
+static void print_server_addresses(int port)
+{
+    printf("\033[1m\033[36m");
+    printf("┌─────────────────────────────────────────┐\n");
+    printf("│         АДРЕСА ДЛЯ ПОДКЛЮЧЕНИЯ          │\n");
+    printf("└─────────────────────────────────────────┘\n");
+    printf("\033[0m");
+ 
+    struct ifaddrs *ifaddr = nullptr;
+    if (getifaddrs(&ifaddr) == -1) {
+        printf("  \033[33mНе удалось определить адреса. Узнай вручную: ip a\033[0m\n\n");
+        return;
+    }
+ 
+    for (struct ifaddrs *ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr) continue;
+        if (ifa->ifa_addr->sa_family != AF_INET) continue;
+        if (!(ifa->ifa_flags & IFF_UP)) continue;
+ 
+        struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &sa->sin_addr, ip, sizeof(ip));
+ 
+        const char *hint  = "";
+        const char *color = "\033[32m";
+ 
+        if (strcmp(ifa->ifa_name, "lo") == 0 || strncmp(ip, "127.", 4) == 0) {
+            hint  = "  <- только с этой машины";
+            color = "\033[90m";
+        } else if (strncmp(ip, "192.168.", 8) == 0 || strncmp(ip, "10.", 3) == 0) {
+            hint  = "  <- локальная сеть (рекомендуется)";
+            color = "\033[32m";
+        } else if (strncmp(ip, "172.", 4) == 0) {
+            hint  = "  <- WSL / Docker / VPN";
+            color = "\033[33m";
+        }
+ 
+        printf("  %s%-15s\033[0m : \033[1m%d\033[0m%s\n",
+               color, ip, port, hint);
+    }
+    freeifaddrs(ifaddr);
+}
+
+
+// ──────────────────────────────────────────
+//  main
+// ──────────────────────────────────────────
 int main(int argc, char *argv[])
 {
     int port = DEFAULT_PORT;
@@ -349,7 +402,7 @@ int main(int argc, char *argv[])
 
     log_event("Сервер готов, ожидаем подключений...");
     printf("[server] Запущен на порту %d. Лог: data/server.log\n", port);
-    printf("\033[90m[server] Reload конфига: kill -USR1 %d\033[0m\n", getpid());
+    print_server_addresses(port);
 
     // ── Основной цикл accept() ──
     while (1) {

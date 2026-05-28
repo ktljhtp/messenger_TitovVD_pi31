@@ -297,6 +297,40 @@ static void cmd_newgroup(int client_fd, const char *login,
 
     log_event("Группа '%s' создана пользователем '%s'", group_name, login);
     send_sys(client_fd, login, "OK_NEWGROUP");
+
+    // Рассылаем GROUP_ADDED всем участникам кроме создателя —
+    // они сразу увидят новую группу в списке чатов
+    {
+        char notify_text[128];
+        snprintf(notify_text, sizeof(notify_text), "GROUP_ADDED:%s", group_name);
+
+        if (colon) {
+            // Перебираем участников заново (strtok уже сдвинул указатель — используем копию)
+            char members_copy[512];
+            strncpy(members_copy, colon + 1, sizeof(members_copy) - 1);
+            char *member = strtok(members_copy, ":");
+            while (member) {
+                if (strcmp(member, login) != 0) {
+                    // Открываем FIFO участника если он онлайн
+                    char fifo_path[FIFO_MAXPATH];
+                    snprintf(fifo_path, sizeof(fifo_path), FIFO_PATH, member);
+                    int fd = open(fifo_path, O_WRONLY | O_NONBLOCK);
+                    if (fd >= 0) {
+                        Message note = {};
+                        note.msg_type  = MSG_SYSTEM;
+                        note.timestamp = time(nullptr);
+                        strncpy(note.sender,        "server", sizeof(note.sender) - 1);
+                        strncpy(note.dest.receiver, member,   sizeof(note.dest.receiver) - 1);
+                        strncpy(note.text, notify_text,       sizeof(note.text) - 1);
+                        write(fd, &note, sizeof(Message));
+                        close(fd);
+                        log_event("Уведомление GROUP_ADDED:%s → %s", group_name, member);
+                    }
+                }
+                member = strtok(nullptr, ":");
+            }
+        }
+    }
 }
 
 // ──────────────────────────────────────────
